@@ -1,0 +1,5 @@
+bolt:
+  url: bolt://galaxy:7687
+  graph_name: test
+  user: admin
+  password: admin
