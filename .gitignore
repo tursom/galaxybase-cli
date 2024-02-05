@@ -2,3 +2,6 @@
 .idea
 .history.txt
 config.yml
+build
+dist
+cli.spec

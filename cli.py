@@ -28,9 +28,9 @@ def map_results(results: Iterable[graphdbapi.Record]) -> tuple[list[str], list[a
 
 def connect():
     parser = argparse.ArgumentParser(
-        prog='galaxybase cli',
-        description='galaxybase graph database cli client.',  # 描述
-        epilog='Copyright(r), 2024'  # 说明信息
+        prog="galaxybase cli",
+        description="galaxybase graph database cli client.",  # 描述
+        epilog="Copyright(r), 2024"  # 说明信息
     )
 
     parser.add_argument(
@@ -102,12 +102,12 @@ def main():
     driver, graph = connect()
 
     cypher_words = [
-        'all', 'and', 'as', 'asc', 'ascending', 'assert', 'by', 'call', 'case', 'commit', 'constraint', 'contains',
-        'count', 'create', 'csv', 'delete', 'desc', 'descending', 'detach', 'distinct', 'drop', 'else', 'end', 'ends',
-        'exists', 'false', 'foreach', 'from', 'in', 'index', 'insert', 'is', 'join', 'key', 'limit', 'load', 'match',
-        'merge', 'node', 'not', 'null', 'on', 'optional', 'or', 'periodic', 'remove', 'return', 'scan', 'set', 'skip',
-        'start', 'starts', 'then', 'true', 'union', 'unique', 'unwind', 'update', 'using', 'when', 'where', 'with',
-        'xor', 'yield',
+        "all", "and", "as", "asc", "ascending", "assert", "by", "call", "case", "commit", "constraint", "contains",
+        "count", "create", "csv", "delete", "desc", "descending", "detach", "distinct", "drop", "else", "end", "ends",
+        "exists", "explain", "false", "foreach", "from", "in", "index", "insert", "is", "join", "key", "limit", "load",
+        "match", "merge", "node", "not", "null", "on", "optional", "or", "periodic", "profile", "remove", "return",
+        "scan", "set", "skip", "start", "starts", "then", "true", "union", "unique", "unwind", "update", "using",
+        "when", "where", "with", "xor", "yield",
     ]
     functions = [
         # 断言函数
