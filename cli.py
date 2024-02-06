@@ -1,32 +1,278 @@
 import argparse
+import functools
+import json
+import re
 import sys
 from typing import Iterable
 
 import graphdbapi
 import yaml
+from graphdbapi.v1.graph.GsGraph import GsGraph
 from prompt_toolkit import prompt
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
-from prompt_toolkit.completion import WordCompleter, FuzzyCompleter, merge_completers, PathCompleter
+from prompt_toolkit.completion import WordCompleter, FuzzyCompleter, merge_completers, PathCompleter, Completer
 from tabulate import tabulate
 
 from graphdbapi.db import GraphDb
 from bolt.exceptions import DatabaseException
 from bolt.message.exceptions import ClientException, GraphDbException
 
+procedure_args_re = re.compile("([a-zA-Z]+) :: ")
+space_re = re.compile("\\s+")
 
-def map_results(results: Iterable[graphdbapi.Record]) -> tuple[list[str], list[any]]:
+cypher_words = [
+    "all", "and", "as", "asc", "ascending", "assert", "by", "call", "case", "commit", "constraint", "contains",
+    "count", "create", "csv", "delete", "desc", "descending", "detach", "distinct", "drop", "else", "end", "ends",
+    "exists", "explain", "false", "foreach", "from", "in", "index", "insert", "is", "join", "key", "limit", "load",
+    "match", "merge", "node", "not", "null", "on", "optional", "or", "periodic", "profile", "remove", "return",
+    "scan", "set", "skip", "start", "starts", "then", "true", "union", "unique", "unwind", "update", "using",
+    "when", "where", "with", "xor", "yield",
+]
+cypher_functions = [
+    # 断言函数
+    "all", "any", "exists", "none", "single",
+    # 标量函数
+    "coalesce", "endNode", "head", "id", "last", "length", "properties", "randomUUID", "size", "startNode",
+    "timestamp", "toBoolean", "toFloat", "toBigDecimal", "toInteger", "type",
+    # 聚合函数
+    "avg", "collect", "count", "max", "min", "percentileCont", "percentileDisc", "stDev", "stDevP", "sum",
+    # 列表函数
+    "keys", "labels", "nodes", "range", "reduce", "relationships", "reverse", "tail",
+    # 数学函数
+    "abs", "ceil", "follr", "rand", "round", "sign",
+    # 数学函数-对数和幂
+    "e", "exp", "log", "log10", "sqrt",
+    # 数学函数-三角函数
+    "acos", "asin", "atan", "atan2", "cos", "cot", "degrees", "haversin", "pi", "radians", "sin", "tan",
+    # 字符串函数
+    "left", "ltrim", "replace", "right", "rtrim", "split", "substring", "toLower", "toUpper", "trim",
+    # 时间函数 - 时刻类型
+    "date", "time", "datetime", "timezone", "localdatetime", "localtime",
+    "statement", "transaction", "statement", "realtime",
+    "millennium", "century", "decade", "year", "weekYear", "quarter", "month", "week", "day", "hour", "minute",
+    "second", "millisecond", "microsecond",
+    "truncate", "realtime",
+    # 时间函数 - 时段类型
+    "duration", "period",
+    "between", "inMonths", "inDays", "inSeconds",
+    # 空间函数
+    "distance", "point",
+]
+
+
+class Env:
+    def __init__(self):
+        self.other_hint = set()
+
+        args = parse_args()
+        self.args = args
+        self.driver: graphdbapi.Driver | None = None
+        self.graph: GsGraph | None = None
+
+        self.functions = []
+        self.aggregation_functions = []
+        self.procedures = []
+        self.procedure_args = []
+        self.completer: Completer | None = None
+
+        self.cmd_cnt = 0
+        self.cypher = ""
+
+        self.sys_cmd = {}
+        self._define_sys_cmd_handlers()
+
+    def load_completer(self):
+        if self.driver is not None and self.args.load_functions:
+            self.functions = [f["name"] for f in self.driver.execute_cypher("call dbms.functions()")]
+        else:
+            self.functions = []
+
+        if self.driver is not None and self.args.load_aggregation:
+            self.aggregation_functions = [f["name"] for f in
+                                          self.driver.execute_cypher("call dbms.aggregationFunctions()")]
+        else:
+            self.aggregation_functions = []
+
+        if self.driver is not None and self.args.load_procedures:
+            self.procedures = [f["name"] for f in self.driver.execute_cypher("call dbms.procedures()")]
+            self.procedure_args = [
+                arg
+                for args in (procedure_args_re.findall(f["signature"])
+                             for f in self.driver.execute_cypher("call dbms.procedures()"))
+                for arg in args
+            ]
+        else:
+            self.procedures = []
+            self.procedure_args = []
+
+        self.completer = FuzzyCompleter(
+            merge_completers([
+                WordCompleter(
+                    list(set(
+                        [w.lower() for w in cypher_words] +
+                        [w.upper() for w in cypher_words] +
+                        cypher_functions +
+                        self.functions +
+                        self.aggregation_functions +
+                        self.procedures +
+                        ["call " + p for p in self.procedures] +
+                        ["CALL " + p for p in self.procedures] +
+                        self.procedure_args +
+                        [f":{k}" for k in self.sys_cmd.keys()] +
+                        list(self.other_hint)
+                    )),
+                    ignore_case=True,
+                    WORD=True,
+                ),
+                PathCompleter(),
+            ])
+        )
+
+    def message(self):
+        if self.cypher == "":
+            return self._message()
+        else:
+            return ("." * (len(self._message()) - 2)) + "> "
+
+    def _message(self):
+        if self.graph is None:
+            return f"[{self.cmd_cnt}] cypher> "
+        else:
+            return f"[{self.cmd_cnt}] {self.graph.name}> "
+
+    def get_sys_cmd_handler(self, cmd):
+        return self.sys_cmd.get(
+            space_re.split(cmd)[0],
+            lambda: print("Unknown command.")
+        )
+
+    def _sys_cmd_handler(self, cmd):
+        def decorator(func):
+            self.sys_cmd[cmd] = func
+            return func
+
+        return decorator
+
+    def _define_sys_cmd_handlers(self):
+        @self._sys_cmd_handler("exit")
+        def exit_handler():
+            sys.exit(0)
+
+        @self._sys_cmd_handler("graph")
+        def graph_handler():
+            graph_name = self.cypher[7:].strip()
+            if len(graph_name) == 0:
+                print("graph name can not be empty.")
+            else:
+                self.graph = GraphDb.driver_by_name(self.driver, graph_name)
+
+        self.other_hint.add(":show graphs")
+        self.other_hint.add(":show edges")
+        self.other_hint.add(":show vertexes")
+
+        @self._sys_cmd_handler("show")
+        def show_handler():
+            if self.cypher.startswith(":show graphs"):
+                print(tabulate([[g] for g in GraphDb.graphs(self.driver)], headers=["graph"], tablefmt="outline"))
+            elif self.cypher.startswith(":show edges"):
+                edges = self.graph.schema().get_edge_types()
+                print(tabulate([[e] for e in edges], headers=["edge"], tablefmt="outline"))
+            elif self.cypher.startswith(":show vertexes"):
+                vertexes = self.graph.schema().get_vertex_types()
+                print(tabulate([[v] for v in vertexes], headers=["vertex"], tablefmt="outline"))
+            else:
+                print("Unknown command.")
+
+        @self._sys_cmd_handler("graphs")
+        def graphs():
+            print(tabulate([[g] for g in GraphDb.graphs(self.driver)], headers=["graph"], tablefmt="outline"))
+
+        @self._sys_cmd_handler("graph_index")
+        def graph_index():
+            indexes = GraphDb.graphx_indexs(self.driver)
+            print(indexes)
+
+        @self._sys_cmd_handler("new_graph")
+        def new_graph():
+            graph_name = self.cypher[10:].strip()
+            GraphDb.new_graph(self.driver, graph_name)
+            self.graph = GraphDb.driver_by_name(self.driver, graph_name)
+
+        @self._sys_cmd_handler("delete_graph")
+        def delete_graph():
+            graph_name = self.cypher[13:].strip()
+            graph = GraphDb.driver_by_name(self.driver, graph_name)
+            graph.delete_graph()
+            if graph.name == self.graph.name:
+                self.graph = None
+
+        @self._sys_cmd_handler("metrics")
+        def metrics():
+            for m in GraphDb.metrics(self.driver):
+                print(tabulate([
+                    ["id", m.get_id()],
+                    ["node_start_time", m.get_node_start_time()],
+                    ["addresses", list(m.get_addresses())],
+                    ["host_name", list(m.get_host_name())],
+                    ["heap_init", m.get_heap_init()],
+                    ["heap_used", m.get_heap_used()],
+                    ["heap_committed", m.get_heap_committed()],
+                    ["heap_max", m.get_heap_max()],
+                    ["heap_total", m.get_heap_total()],
+                    ["last_update_time", m.get_last_update_time()],
+                    ["thread_cnt", m.get_thread_cnt()],
+                    ["daemon_thread_cnt", m.get_daemon_thread_cnt()],
+                    ["peak_thread_cnt", m.get_peak_thread_cnt()],
+                    ["started_thread_cnt", m.get_started_thread_cnt()],
+                    ["graph_metrics", m.get_graph_metrics()],
+                ], tablefmt="outline"))
+
+        @self._sys_cmd_handler("history")
+        def history():
+            fh = FileHistory(".history.txt")
+
+            cnt = self.cypher[8:].strip()
+            if len(cnt) == 0:
+                cnt = 1000
+            else:
+                cnt = int(cnt)
+
+            histories = []
+            for h in fh.load_history_strings():
+                if cnt <= 0:
+                    break
+
+                histories.append([h])
+
+                cnt = cnt - 1
+
+            histories.reverse()
+            print(tabulate(histories, headers=["id", "history"], tablefmt="outline"))
+
+        self.load_completer()
+
+
+def map_results(max_value_length: int | None, results: Iterable[graphdbapi.Record]) -> tuple[list[str], list[any]]:
     keys = []
     values = []
     for r in results:
         if len(keys) == 0:
             keys = r.keys()
-        values.append(r.values())
 
-    return keys, values
+        if len(values) >= 20:
+            yield keys, values
+            values = []
+
+        if max_value_length is not None and max_value_length <= 0:
+            values.append(r.values())
+        else:
+            values.append([str(v)[:max_value_length] for v in r.values()])
+
+    yield keys, values
 
 
-def connect():
+def parse_args():
     parser = argparse.ArgumentParser(
         prog="galaxybase cli",
         description="galaxybase graph database cli client.",  # 描述
@@ -59,8 +305,33 @@ def connect():
         help="The config file.",
     )
 
-    args = parser.parse_args()
+    parser.add_argument(
+        "--load_functions",
+        default=True,
+        help="Load graph functions for auto complete.",
+    )
+    parser.add_argument(
+        "--load_aggregation",
+        default=True,
+        help="Load graph aggregation functions for auto complete.",
+    )
+    parser.add_argument(
+        "--load_procedures",
+        default=True,
+        help="Load graph procedures for auto complete.",
+    )
 
+    parser.add_argument(
+        "--mvl", "--max_value_length",
+        default=None,
+        help="Load graph procedures for auto complete.",
+        type=int,
+    )
+
+    return parser.parse_args()
+
+
+def connect(args):
     config_file = args.config
     if config_file is not None:
         with open(config_file, "r", encoding="UTF-8") as f:
@@ -89,228 +360,67 @@ def connect():
     graph_name = args.graph
     if graph_name is None and cfg is not None and "bolt" in cfg:
         graph_name = cfg["bolt"].get("graph", None)
-    if graph_name is None:
-        graph_name = prompt("graph: ")
+    # if graph_name is None:
+    #     graph_name = prompt("graph: ")
 
     driver = GraphDb.connect(url, user, password)
-    graph = GraphDb.driver_by_name(driver, graph_name)
+    if graph_name is not None:
+        graph = GraphDb.driver_by_name(driver, graph_name)
+    else:
+        graph = None
 
     return driver, graph
 
 
 def main():
-    driver, graph = connect()
+    env = Env()
+    env.driver, env.graph = connect(env.args)
+    env.load_completer()
 
-    cypher_words = [
-        "all", "and", "as", "asc", "ascending", "assert", "by", "call", "case", "commit", "constraint", "contains",
-        "count", "create", "csv", "delete", "desc", "descending", "detach", "distinct", "drop", "else", "end", "ends",
-        "exists", "explain", "false", "foreach", "from", "in", "index", "insert", "is", "join", "key", "limit", "load",
-        "match", "merge", "node", "not", "null", "on", "optional", "or", "periodic", "profile", "remove", "return",
-        "scan", "set", "skip", "start", "starts", "then", "true", "union", "unique", "unwind", "update", "using",
-        "when", "where", "with", "xor", "yield",
-    ]
-    functions = [
-        # 断言函数
-        "all", "any", "exists", "none", "single",
-        # 标量函数
-        "coalesce", "endNode", "head", "id", "last", "length", "properties", "randomUUID", "size", "startNode",
-        "timestamp", "toBoolean", "toFloat", "toBigDecimal", "toInteger", "type",
-        # 聚合函数
-        "avg", "collect", "count", "max", "min", "percentileCont", "percentileDisc", "stDev", "stDevP", "sum",
-        # 列表函数
-        "keys", "labels", "nodes", "range", "reduce", "relationships", "reverse", "tail",
-        # 数学函数
-        "abs", "ceil", "follr", "rand", "round", "sign",
-        # 数学函数-对数和幂
-        "e", "exp", "log", "log10", "sqrt",
-        # 数学函数-三角函数
-        "acos", "asin", "atan", "atan2", "cos", "cot", "degrees", "haversin", "pi", "radians", "sin", "tan",
-        # 字符串函数
-        "left", "ltrim", "replace", "right", "rtrim", "split", "substring", "toLower", "toUpper", "trim",
-        # 时间函数 - 时刻类型
-        "date", "time", "datetime", "timezone", "localdatetime", "localtime",
-        "statement", "transaction", "statement", "realtime",
-        "millennium", "century", "decade", "year", "weekYear", "quarter", "month", "week", "day", "hour", "minute",
-        "second", "millisecond", "microsecond",
-        "truncate", "realtime",
-        # 时间函数 - 时段类型
-        "duration", "period",
-        "between", "inMonths", "inDays", "inSeconds",
-        # 空间函数
-        "distance", "point",
-    ]
-    apoc_functions = [
-        # 数学函数
-        "apoc.math.round", "apoc.math.maxLong", "apoc.math.minLong", "apoc.math.maxDouble", "apoc.math.minDouble",
-        "apoc.math.maxInt", "apoc.math.minInt", "apoc.math.maxByte", "apoc.math.minByte", "apoc.math.random",
-        "apoc.math.sqrt", "apoc.math.acos", "apoc.math.asin", "apoc.math.atan", "apoc.math.atan2", "apoc.math.cbrt",
-        "apoc.math.ceil", "apoc.math.cos", "apoc.math.copySign", "apoc.math.cosh", "apoc.math.exp", "apoc.math.expm1",
-        "apoc.math.floor", "apoc.math.hypot", "apoc.math.IEEEremainder", "apoc.math.log", "apoc.math.log1p",
-        "apoc.math.addExact", "apoc.math.decrementExact", "apoc.math.floorDiv", "apoc.math.floorMod",
-        "apoc.math.getExponent", "apoc.math.incrementExact", "apoc.math.max", "apoc.math.min", "apoc.math.log10",
-        "apoc.math.nextAfter", "apoc.math.nextDown", "apoc.math.nextUp", "apoc.math.pow", "apoc.math.rint",
-        "apoc.math.scalb", "apoc.math.signum", "apoc.math.sin", "apoc.math.sinh", "apoc.math.tan",
-        "apoc.math.multiplyExact", "apoc.math.negateExact", "apoc.math.subtractExact", "apoc.math.toIntExact",
-        "apoc.math.tanh", "apoc.math.toDegrees", "apoc.math.toRadians", "apoc.math.ulp",
-
-        # 位操作
-        "apoc.bitwise.op",
-
-        # 地址解析
-        "apoc.data.email", "apoc.data.url",
-
-        # 集合操作
-        "apoc.coll.zip", "apoc.coll.pairs", "apoc.coll.pairsMin", "apoc.coll.sum", "apoc.coll.avg", "apoc.coll.min",
-        "apoc.coll.max", "apoc.coll.contains", "apoc.coll.set", "apoc.coll.insert", "apoc.coll.insertAll",
-        "apoc.coll.remove", "apoc.coll.indexOf", "apoc.coll.containsAll", "apoc.coll.containsSorted",
-        "apoc.coll.containsAllSorted", "apoc.coll.isEqualCollection", "apoc.coll.toSet", "apoc.coll.sumLongs",
-        "apoc.coll.sort", "apoc.coll.sortNodes", "apoc.coll.sortMaps", "apoc.coll.union", "apoc.coll.subtract",
-        "apoc.coll.removeAll", "apoc.coll.intersection", "apoc.coll.disjunction", "apoc.coll.unionAll",
-        "apoc.coll.shuffle", "apoc.coll.randomItem", "apoc.coll.randomItems", "apoc.coll.containsDuplicates",
-        "apoc.coll.duplicates", "apoc.coll.duplicatesWithCount", "apoc.coll.frequencies", "apoc.coll.frequenciesAsMap",
-        "apoc.coll.occurrences", "apoc.coll.flatten", "apoc.coll.reverse", "apoc.coll.different",
-        "apoc.coll.dropDuplicateNeighbors", "apoc.coll.fill",
-
-        # 类型转换
-        "apoc.convert.toMap", "apoc.convert.toString", "apoc.convert.toList", "apoc.convert.toBoolean",
-        "apoc.convert.toNode", "apoc.convert.toRelationship", "apoc.convert.toInteger", "apoc.convert.toSet",
-        "apoc.convert.toIntList", "apoc.convert.toStringList", "apoc.convert.toBooleanList", "apoc.convert.toNodeList",
-        "apoc.convert.toRelationshipList",
-
-        # JSON转换
-        "apoc.json.path", "apoc.convert.toJson", "apoc.convert.fromJsonMap", "apoc.convert.fromJsonList",
-        "apoc.convert.toSortedJsonMap",
-
-        # 时间转换
-        "apoc.date.toYears", "apoc.date.fields", "apoc.date.field", "apoc.date.currentTimestamp", "apoc.date.format",
-        "apoc.date.toISO8601", "apoc.date.fromISO8601", "apoc.date.parse", "apoc.date.parseAsZonedDateTime",
-        "apoc.date.systemTimezone", "apoc.date.convert", "apoc.date.convertFormat", "apoc.date.add",
-
-        # Map操作
-        "apoc.map.groupBy", "apoc.map.groupByMulti", "apoc.map.fromPairs", "apoc.map.fromLists", "apoc.map.values",
-        "apoc.map.fromValues", "apoc.map.merge", "apoc.map.mergeList", "apoc.map.get", "apoc.map.mget",
-        "apoc.map.submap", "apoc.map.setKey", "apoc.map.setEntry", "apoc.map.setPairs", "apoc.map.setLists",
-        "apoc.map.setValues", "apoc.map.removeKey", "apoc.map.removeKeys", "apoc.map.clean", "apoc.map.updateTree",
-        "apoc.map.flatten", "apoc.map.sortedProperties",
-
-        # 获取类型
-        "apoc.meta.type", "apoc.meta.typeName", "apoc.meta.types", "apoc.meta.isType", "apoc.meta.cypher.type",
-        "apoc.meta.cypher.types",
-
-        # 数字转换
-        "apoc.number.format", "apoc.number.parseInt", "apoc.number.parseFloat", "apoc.number.romanToArabic",
-        "apoc.number.arabicToRoman",
-
-        # 大数操作
-        "apoc.number.exact.add", "apoc.number.exact.sub", "apoc.number.exact.mul", "apoc.number.exact.div",
-        "apoc.number.exact.toInteger", "apoc.number.exact.toFloat", "apoc.number.exact.toExact",
-
-        # 分数计算
-        "apoc.scoring.existence", "apoc.scoring.pareto",
-
-        # 临时转换
-        "apoc.temporal.format", "apoc.temporal.formatDuration",
-
-        # 语音匹配算法
-        "apoc.text.phonetic", "apoc.text.doubleMetaphone",
-
-        # 字符串操作
-        "apoc.text.indexOf", "apoc.text.indexesOf", "apoc.text.replace", "apoc.text.byteCount", "apoc.text.bytes",
-        "apoc.text.regreplace", "apoc.text.split", "apoc.text.regexGroups", "apoc.text.join", "apoc.text.clean",
-        "apoc.text.compareCleaned", "apoc.text.distance", "apoc.text.levenshteinSimilarity",
-        "apoc.text.hammingDistance", "apoc.text.jaroWinklerDistance", "apoc.text.sorensenDiceSimilarity",
-        "apoc.text.fuzzyMatch", "apoc.text.urlencode", "apoc.text.urldecode", "apoc.text.lpad", "apoc.text.rpad",
-        "apoc.text.format", "apoc.text.slug", "apoc.text.random", "apoc.text.capitalize", "apoc.text.capitalizeAll",
-        "apoc.text.decapitalize", "apoc.text.decapitalizeAll", "apoc.text.swapCase", "apoc.text.camelCase",
-        "apoc.text.upperCamelCase", "apoc.text.snakeCase", "apoc.text.toUpperCase", "apoc.text.base64Encode",
-        "apoc.text.base64Decode", "apoc.text.base64UrlEncode", "apoc.text.base64UrlDecode", "apoc.text.charAt",
-        "apoc.text.code", "apoc.text.hexValue", "apoc.text.hexCharAt", "apoc.text.toCypher", "apoc.text.repeat",
-
-        # 加密
-        "apoc.hashing.fingerprint",
-
-        # 创建
-        "apoc.create.uuid", "apoc.create.vNode", "apoc.create.virtual.fromNode",
-
-        # 比较
-        "apoc.diff.nodes",
-
-        # 路径
-        "apoc.path.slice", "apoc.path.elements",
-
-        # 点操作
-        "apoc.node.relationship", "apoc.nodes.connected", "apoc.node.labels", "apoc.node.id", "apoc.rel.id",
-        "apoc.rel.type", "apoc.any.properties", "apoc.any.property", "apoc.node.degree", "apoc.node.degree.in",
-        "apoc.node.degree.out",
-
-        # 聚合数列
-        "apoc.agg.nth", "apoc.agg.first", "apoc.agg.last", "apoc.agg.slice",
-
-        # 中位数
-        "apoc.agg.median",
-
-        # 百分数
-        "apoc.agg.percentiles",
-
-        # 乘积
-        "apoc.agg.product",
-
-        # 统计数据
-        "apoc.agg.statistics",
-    ]
-
-    open_cypher_completer = FuzzyCompleter(
-        merge_completers([
-            WordCompleter(
-                list(set([w.lower() for w in cypher_words] + [w.upper() for w in
-                                                              cypher_words] + functions + apoc_functions)),
-                ignore_case=True,
-                WORD=True,
-            ),
-            PathCompleter(),
-        ])
-    )
-
-    cmd_cnt = 0
-
-    cypher = ""
     while True:
-        if cypher == "":
-            message = f"[{cmd_cnt}] cypher> "
-        else:
-
-            message = ("." * (len(str(cmd_cnt)) + 9)) + "> "
+        message = env.message()
 
         try:
             line = prompt(
                 message,
                 history=FileHistory(".history.txt"),
                 auto_suggest=AutoSuggestFromHistory(),
-                completer=open_cypher_completer,
-                reserve_space_for_menu=4,
+                completer=env.completer,
+                reserve_space_for_menu=6,
             )
         except KeyboardInterrupt:
-            cypher = ""
+            env.cypher = ""
             continue
         except (KeyboardInterrupt, EOFError):
             break
 
         if line.endswith("\\"):
-            cypher = cypher + line[:-1] + "\n"
+            env.cypher = env.cypher + line[:-1] + "\n"
         else:
-            cypher = cypher + line
-            if len(cypher) == 0:
+            env.cypher = env.cypher + line
+            if len(env.cypher) == 0:
                 continue
             try:
-                (keys, values) = map_results(graph.execute_cypher(cypher, None))
-                print(tabulate(values, headers=keys, tablefmt="grid"))
+                if env.cypher.startswith(":"):
+                    env.get_sys_cmd_handler(env.cypher[1:])()
+                    continue
 
-                cmd_cnt = cmd_cnt + 1
+                if env.graph is None:
+                    results = env.driver.execute_cypher(env.cypher, None)
+                else:
+                    results = env.graph.execute_cypher(env.cypher, None)
+                for (keys, values) in map_results(
+                        env.args.mvl,
+                        results,
+                ):
+                    print(tabulate(values, headers=keys, tablefmt="outline"))
+
+                env.cmd_cnt = env.cmd_cnt + 1
             except (DatabaseException, ClientException, GraphDbException) as e:
                 print(e)
                 continue
             finally:
-                cypher = ""
+                env.cypher = ""
 
 
 if __name__ == "__main__":
